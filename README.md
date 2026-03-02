@@ -18,6 +18,8 @@ This project is a direct port and adaptation of Andrej Karpathy's excellent [mic
 1. **First Execution**: If `model.bin` is not found, the model will initialize random weights and begin training on `names.txt` for 1000 steps. After training, it saves the parameters to `model.bin` and performs inference.
 2. **Subsequent Executions**: The model detects `model.bin`, instantly loads the trained parameters, and proceeds directly to generating text (inference mode).
 
+> **Note:** To retrain the model from scratch, simply delete the generated `model.bin` file and run the executable again.
+
 ## Structure
 - `main.zc`: The core GPT implementation, autograd engine, and training loop.
 - `names.txt`: 32,000 name dataset for training.
