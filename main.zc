@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 #define ZALLOC_IMPLEMENTATION
 #include "zalloc.h"
@@ -458,7 +459,7 @@ fn gpt_forward(model: GPT*, token_id: int, pos_id: int, keys: Value***, values: 
 // 7. Main: Training + Inference
 // ═══════════════════════════════════════════════════════════════════
 fn main() {
-    srand(42);
+    srand(time((void*)0));
     println "=== ZenCPT ===";
     zarena_init(&graph_arena);
 
