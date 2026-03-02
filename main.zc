@@ -1,0 +1,693 @@
+// ZenCPT — GPT in Zen-C, ported from @karpathy's microgpt.py
+// Single-file GPT with autograd engine, Adam optimizer, and text generation.
+// Uses zalloc.h arena for O(1) graph cleanup per training step.
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
+#define ZALLOC_IMPLEMENTATION
+#include "zalloc.h"
+
+// ═══════════════════════════════════════════════════════════════════
+// Global Arena & Config
+// ═══════════════════════════════════════════════════════════════════
+let graph_arena: struct zarena;
+
+def N_LAYER = 1;
+def N_EMBD = 16;
+def BLOCK_SIZE = 16;
+def N_HEAD = 4;
+def HEAD_DIM = 4;
+def VOCAB_SIZE = 27; // 26 letters + BOS
+def BOS = 26;
+
+// ═══════════════════════════════════════════════════════════════════
+// 1. Autograd Engine
+// ═══════════════════════════════════════════════════════════════════
+struct Value {
+    data: float;
+    grad: float;
+    children: Value**;
+    local_grads: float*;
+    num_children: int;
+    visited: bool;
+}
+
+impl Copy for Value {}
+
+fn new_value(data: float) -> Value* {
+    let v = (Value*)zarena_alloc_zero(&graph_arena, sizeof(Value));
+    v.data = data;
+    v.grad = 0.0;
+    v.children = (Value**)zarena_alloc(&graph_arena, 2 * sizeof(Value*));
+    v.local_grads = (float*)zarena_alloc(&graph_arena, 2 * sizeof(float));
+    v.num_children = 0;
+    v.visited = false;
+    return v;
+}
+
+impl Value {
+    fn add_v(self, other: Value*) -> Value* {
+        let out = new_value(self.data + other.data);
+        out.children[0] = self;
+        out.children[1] = other;
+        out.num_children = 2;
+        out.local_grads[0] = 1.0;
+        out.local_grads[1] = 1.0;
+        return out;
+    }
+
+    fn mul_v(self, other: Value*) -> Value* {
+        let out = new_value(self.data * other.data);
+        out.children[0] = self;
+        out.children[1] = other;
+        out.num_children = 2;
+        out.local_grads[0] = other.data;
+        out.local_grads[1] = self.data;
+        return out;
+    }
+
+    fn div_v(self, other: Value*) -> Value* {
+        let sd = self.data;
+        let od = other.data;
+        let out = new_value(sd / od);
+        out.children[0] = self;
+        out.children[1] = other;
+        out.num_children = 2;
+        out.local_grads[0] = 1.0 / od;
+        out.local_grads[1] = (-1.0 * sd) / (od * od);
+        return out;
+    }
+
+    fn pow_v(self, power: float) -> Value* {
+        let out = new_value(powf(self.data, power));
+        out.children[0] = self;
+        out.num_children = 1;
+        out.local_grads[0] = power * powf(self.data, power - 1.0);
+        return out;
+    }
+
+    fn log_v(self) -> Value* {
+        let safe = self.data;
+        if safe < 0.0000001 { safe = 0.0000001; }
+        let out = new_value(logf(safe));
+        out.children[0] = self;
+        out.num_children = 1;
+        out.local_grads[0] = 1.0 / safe;
+        return out;
+    }
+
+    fn exp_v(self) -> Value* {
+        let clamped = self.data;
+        if clamped > 20.0 { clamped = 20.0; }
+        if clamped < -20.0 { clamped = -20.0; }
+        let e = expf(clamped);
+        let out = new_value(e);
+        out.children[0] = self;
+        out.num_children = 1;
+        out.local_grads[0] = e;
+        return out;
+    }
+
+    fn relu_v(self) -> Value* {
+        let d = self.data;
+        let out_data = d;
+        if d < 0.0 { out_data = 0.0; }
+        let out = new_value(out_data);
+        out.children[0] = self;
+        out.num_children = 1;
+        let g = 1.0;
+        if d <= 0.0 { g = 0.0; }
+        out.local_grads[0] = g;
+        return out;
+    }
+
+    fn neg_v(self) -> Value* {
+        return self.mul_v(new_value(-1.0));
+    }
+
+    fn sub_v(self, other: Value*) -> Value* {
+        return self.add_v(other.neg_v());
+    }
+
+    // Topological sort + backward pass
+    fn backward(self) {
+        let topo_arena: struct zarena;
+        zarena_init(&topo_arena);
+        defer zarena_free(&topo_arena);
+
+        let max_nodes = 500000;
+        let topo = (Value**)zarena_alloc(&topo_arena, max_nodes * sizeof(Value*));
+        let topo_count = 0;
+
+        let stack = (Value**)zarena_alloc(&topo_arena, max_nodes * sizeof(Value*));
+        let stack_ptr = 0;
+
+        stack[stack_ptr] = self;
+        stack_ptr = stack_ptr + 1;
+
+        while stack_ptr > 0 {
+            let v = (Value*)stack[stack_ptr - 1];
+
+            if !v.visited {
+                v.visited = true;
+                let pushed = false;
+                for let i = 0; i < v.num_children; i = i + 1 {
+                    let child = (Value*)v.children[i];
+                    if !child.visited {
+                        stack[stack_ptr] = child;
+                        stack_ptr = stack_ptr + 1;
+                        pushed = true;
+                    }
+                }
+                if !pushed {
+                    topo[topo_count] = v;
+                    topo_count = topo_count + 1;
+                    stack_ptr = stack_ptr - 1;
+                }
+            } else {
+                let in_topo = false;
+                for let k = 0; k < topo_count; k = k + 1 {
+                    if topo[k] == v { in_topo = true; break; }
+                }
+                if !in_topo {
+                    topo[topo_count] = v;
+                    topo_count = topo_count + 1;
+                }
+                stack_ptr = stack_ptr - 1;
+            }
+        }
+
+        self.grad = 1.0;
+        for let i = topo_count - 1; i >= 0; i = i - 1 {
+            let v = (Value*)topo[i];
+            for let j = 0; j < v.num_children; j = j + 1 {
+                let child = (Value*)v.children[j];
+                child.grad = child.grad + (v.local_grads[j] * v.grad);
+            }
+            v.visited = false;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 2. Math Helpers
+// ═══════════════════════════════════════════════════════════════════
+fn gauss_std(std: float) -> float {
+    let max_r = 32767.0 + 1.0;
+    let u1 = (rand() * 1.0) / max_r;
+    let u2 = (rand() * 1.0) / max_r;
+    if u1 < 0.0000001 { u1 = 0.0000001; }
+    let z0 = sqrtf(-2.0 * logf(u1)) * cosf(2.0 * 3.1415926535 * u2);
+    return z0 * std;
+}
+
+// Create a matrix of Value* stored in heap (permanent params)
+fn create_matrix(rows: int, cols: int, std: float) -> Value** {
+    let mat = (Value**)malloc(rows * cols * sizeof(Value*));
+    for let i = 0; i < rows * cols; i = i + 1 {
+        let v = (Value*)malloc(sizeof(Value));
+        v.data = gauss_std(std);
+        v.grad = 0.0;
+        v.num_children = 0;
+        v.visited = false;
+        v.children = (Value**)0;
+        v.local_grads = (float*)0;
+        mat[i] = v;
+    }
+    return mat;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 3. Neural Network Operations
+// ═══════════════════════════════════════════════════════════════════
+
+// linear: y = W @ x (W is out_len x x_len, row-major)
+fn linear(x: Value**, x_len: int, w: Value**, out_len: int) -> Value** {
+    let out = (Value**)zarena_alloc(&graph_arena, out_len * sizeof(Value*));
+    for let o = 0; o < out_len; o = o + 1 {
+        let sum_val = (Value*)new_value(0.0);
+        for let i = 0; i < x_len; i = i + 1 {
+            let wi = (Value*)w[o * x_len + i];
+            let xi = (Value*)x[i];
+            let prod = wi.mul_v(xi);
+            sum_val = sum_val.add_v(prod);
+        }
+        out[o] = sum_val;
+    }
+    return out;
+}
+
+// softmax with numerical stability (max subtraction)
+fn softmax(logits: Value**, len: int) -> Value** {
+    let first = (Value*)logits[0];
+    let max_val = first.data;
+    for let i = 1; i < len; i = i + 1 {
+        let l = (Value*)logits[i];
+        if l.data > max_val { max_val = l.data; }
+    }
+
+    let max_node = (Value*)new_value(max_val);
+    let exps = (Value**)zarena_alloc(&graph_arena, len * sizeof(Value*));
+    let total = (Value*)new_value(0.0);
+
+    for let i = 0; i < len; i = i + 1 {
+        let li = (Value*)logits[i];
+        let diff = li.sub_v(max_node);
+        let e = diff.exp_v();
+        exps[i] = e;
+        total = total.add_v(e);
+    }
+
+    let out = (Value**)zarena_alloc(&graph_arena, len * sizeof(Value*));
+    for let i = 0; i < len; i = i + 1 {
+        let ei = (Value*)exps[i];
+        out[i] = ei.div_v(total);
+    }
+    return out;
+}
+
+// RMS normalization
+fn rmsnorm(x: Value**, len: int) -> Value** {
+    let ms = (Value*)new_value(0.0);
+    for let i = 0; i < len; i = i + 1 {
+        let xi = (Value*)x[i];
+        ms = ms.add_v(xi.mul_v(xi));
+    }
+    ms = ms.div_v(new_value(len * 1.0));
+    let scale = ms.add_v(new_value(0.0001));
+    scale = scale.pow_v(-0.5);
+
+    let out = (Value**)zarena_alloc(&graph_arena, len * sizeof(Value*));
+    for let i = 0; i < len; i = i + 1 {
+        let xi = (Value*)x[i];
+        out[i] = xi.mul_v(scale);
+    }
+    return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. GPT Architecture
+// ═══════════════════════════════════════════════════════════════════
+struct GPTLayer {
+    attn_wq: Value**;
+    attn_wk: Value**;
+    attn_wv: Value**;
+    attn_wo: Value**;
+    mlp_fc1: Value**;
+    mlp_fc2: Value**;
+}
+
+struct GPT {
+    wte: Value**;
+    wpe: Value**;
+    lm_head: Value**;
+    layers: GPTLayer[N_LAYER];
+    all_params: Value**;
+    num_params: int;
+}
+
+fn init_gpt() -> GPT {
+    let model: GPT;
+    model.wte = create_matrix(VOCAB_SIZE, N_EMBD, 0.08);
+    model.wpe = create_matrix(BLOCK_SIZE, N_EMBD, 0.08);
+    model.lm_head = create_matrix(VOCAB_SIZE, N_EMBD, 0.08);
+
+    let total_params = (VOCAB_SIZE * N_EMBD) + (BLOCK_SIZE * N_EMBD) + (VOCAB_SIZE * N_EMBD);
+    for let li = 0; li < N_LAYER; li = li + 1 {
+        model.layers[li].attn_wq = create_matrix(N_EMBD, N_EMBD, 0.08);
+        model.layers[li].attn_wk = create_matrix(N_EMBD, N_EMBD, 0.08);
+        model.layers[li].attn_wv = create_matrix(N_EMBD, N_EMBD, 0.08);
+        model.layers[li].attn_wo = create_matrix(N_EMBD, N_EMBD, 0.08);
+        model.layers[li].mlp_fc1 = create_matrix(4 * N_EMBD, N_EMBD, 0.08);
+        model.layers[li].mlp_fc2 = create_matrix(N_EMBD, 4 * N_EMBD, 0.08);
+        total_params = total_params + (4 * N_EMBD * N_EMBD) + (4 * N_EMBD * N_EMBD) + (N_EMBD * 4 * N_EMBD);
+    }
+
+    model.num_params = total_params;
+    model.all_params = (Value**)malloc(total_params * sizeof(Value*));
+    let p_idx = 0;
+
+    // Helper to copy params into flat array
+    let copy_p = fn(m: Value**, count: int, dest: Value**, idx: int) -> int {
+        for let i = 0; i < count; i = i + 1 {
+            let tmp = (Value*)m[i];
+            dest[idx + i] = tmp;
+        }
+        return idx + count;
+    };
+
+    p_idx = copy_p(model.wte, VOCAB_SIZE * N_EMBD, model.all_params, p_idx);
+    p_idx = copy_p(model.wpe, BLOCK_SIZE * N_EMBD, model.all_params, p_idx);
+    p_idx = copy_p(model.lm_head, VOCAB_SIZE * N_EMBD, model.all_params, p_idx);
+
+    for let li = 0; li < N_LAYER; li = li + 1 {
+        p_idx = copy_p(model.layers[li].attn_wq, N_EMBD * N_EMBD, model.all_params, p_idx);
+        p_idx = copy_p(model.layers[li].attn_wk, N_EMBD * N_EMBD, model.all_params, p_idx);
+        p_idx = copy_p(model.layers[li].attn_wv, N_EMBD * N_EMBD, model.all_params, p_idx);
+        p_idx = copy_p(model.layers[li].attn_wo, N_EMBD * N_EMBD, model.all_params, p_idx);
+        p_idx = copy_p(model.layers[li].mlp_fc1, 4 * N_EMBD * N_EMBD, model.all_params, p_idx);
+        p_idx = copy_p(model.layers[li].mlp_fc2, N_EMBD * 4 * N_EMBD, model.all_params, p_idx);
+    }
+
+    return model;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 5. Attention Head (separated to avoid Zen-C nested scope bug)
+// ═══════════════════════════════════════════════════════════════════
+fn compute_head(q_h: Value**, keys_flat: Value**, values_flat: Value**, step_pos: int, hs: int) -> Value** {
+    let attn_logits = (Value**)zarena_alloc(&graph_arena, (step_pos + 1) * sizeof(Value*));
+    for let t = 0; t <= step_pos; t = t + 1 {
+        let dot = (Value*)new_value(0.0);
+        for let j = 0; j < HEAD_DIM; j = j + 1 {
+            let qj = (Value*)q_h[j];
+            let kj = (Value*)keys_flat[t * N_EMBD + hs + j];
+            dot = dot.add_v(qj.mul_v(kj));
+        }
+        attn_logits[t] = dot.div_v(new_value(sqrtf(HEAD_DIM * 1.0)));
+    }
+
+    let attn_weights = softmax(attn_logits, step_pos + 1);
+    let head_out = (Value**)zarena_alloc(&graph_arena, HEAD_DIM * sizeof(Value*));
+
+    for let j = 0; j < HEAD_DIM; j = j + 1 {
+        let acc = (Value*)new_value(0.0);
+        for let t = 0; t <= step_pos; t = t + 1 {
+            let aw = (Value*)attn_weights[t];
+            let vj = (Value*)values_flat[t * N_EMBD + hs + j];
+            acc = acc.add_v(aw.mul_v(vj));
+        }
+        head_out[j] = acc;
+    }
+    return head_out;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 6. GPT Forward Pass
+// ═══════════════════════════════════════════════════════════════════
+fn gpt_forward(model: GPT*, token_id: int, pos_id: int, keys: Value***, values: Value***, step_pos: int) -> Value** {
+    let tok_emb = &model.wte[token_id * N_EMBD];
+    let pos_emb = &model.wpe[pos_id * N_EMBD];
+
+    let x = (Value**)zarena_alloc(&graph_arena, N_EMBD * sizeof(Value*));
+    for let i = 0; i < N_EMBD; i = i + 1 {
+        let ti = (Value*)tok_emb[i];
+        let pi = (Value*)pos_emb[i];
+        x[i] = ti.add_v(pi);
+    }
+    x = rmsnorm(x, N_EMBD);
+
+    for let li = 0; li < N_LAYER; li = li + 1 {
+        let x_res = x;
+        x = rmsnorm(x, N_EMBD);
+
+        let q = linear(x, N_EMBD, model.layers[li].attn_wq, N_EMBD);
+        let k = linear(x, N_EMBD, model.layers[li].attn_wk, N_EMBD);
+        let vv = linear(x, N_EMBD, model.layers[li].attn_wv, N_EMBD);
+
+        // Store k/v element-by-element into flat 2D cache
+        for let d = 0; d < N_EMBD; d = d + 1 {
+            let kd = (Value*)k[d];
+            let vd = (Value*)vv[d];
+            keys[li][step_pos * N_EMBD + d] = kd;
+            values[li][step_pos * N_EMBD + d] = vd;
+        }
+
+        let x_attn = (Value**)zarena_alloc(&graph_arena, N_EMBD * sizeof(Value*));
+        for let h = 0; h < N_HEAD; h = h + 1 {
+            let hs = h * HEAD_DIM;
+            let q_h = &q[hs];
+            let head_result = compute_head(q_h, keys[li], values[li], step_pos, hs);
+            for let j = 0; j < HEAD_DIM; j = j + 1 {
+                let hj = (Value*)head_result[j];
+                x_attn[hs + j] = hj;
+            }
+        }
+
+        x = linear(x_attn, N_EMBD, model.layers[li].attn_wo, N_EMBD);
+        for let i = 0; i < N_EMBD; i = i + 1 {
+            let a = (Value*)x[i];
+            let b = (Value*)x_res[i];
+            x[i] = a.add_v(b);
+        }
+
+        // MLP block
+        x_res = x;
+        x = rmsnorm(x, N_EMBD);
+        x = linear(x, N_EMBD, model.layers[li].mlp_fc1, 4 * N_EMBD);
+        for let i = 0; i < 4 * N_EMBD; i = i + 1 {
+            let xi = (Value*)x[i];
+            x[i] = xi.relu_v();
+        }
+        x = linear(x, 4 * N_EMBD, model.layers[li].mlp_fc2, N_EMBD);
+        for let i = 0; i < N_EMBD; i = i + 1 {
+            let a = (Value*)x[i];
+            let b = (Value*)x_res[i];
+            x[i] = a.add_v(b);
+        }
+    }
+
+    let logits = linear(x, N_EMBD, model.lm_head, VOCAB_SIZE);
+    return logits;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 7. Main: Training + Inference
+// ═══════════════════════════════════════════════════════════════════
+fn main() {
+    srand(42);
+    println "=== ZenCPT ===";
+    zarena_init(&graph_arena);
+
+    // Load dataset from names.txt
+    let max_docs = 35000;
+    let max_name_len = 20;
+    let docs = (char**)malloc(max_docs * sizeof(char*));
+    let num_docs = 0;
+
+    let f = fopen("names.txt", "r");
+    if f == (void*)0 {
+        println "Error: could not open names.txt";
+        exit(1);
+    }
+
+    let line_buf = (char*)malloc(64 * sizeof(char));
+    while fgets(line_buf, 64, f) != (char*)0 {
+        // Strip newline
+        let len = strlen(line_buf);
+        if len > 0 {
+            if line_buf[len - 1] == '\n' { line_buf[len - 1] = '\0'; len = len - 1; }
+        }
+        if len > 0 {
+            if line_buf[len - 1] == '\r' { line_buf[len - 1] = '\0'; len = len - 1; }
+        }
+        if len > 0 {
+            let name = (char*)malloc((len + 1) * sizeof(char));
+            for let i = 0; i <= len; i = i + 1 {
+                name[i] = line_buf[i];
+            }
+            docs[num_docs] = name;
+            num_docs = num_docs + 1;
+            if num_docs >= max_docs { break; }
+        }
+    }
+    fclose(f);
+    free(line_buf);
+    println "Loaded {num_docs} names from names.txt";
+
+    let char_to_idx = fn(c: char) -> int { return c - 'a'; };
+    let idx_to_char = fn(i: int) -> char { return i + 'a'; };
+
+    let model = init_gpt();
+    println "Parameters: {model.num_params}";
+
+    // Try to load saved model
+    let model_file = "model.bin";
+    let mf = fopen(model_file, "rb");
+    if mf != (void*)0 {
+        println "Loading model from model.bin...";
+        let buf = (float*)malloc(model.num_params * sizeof(float));
+        fread(buf, sizeof(float), model.num_params, mf);
+        fclose(mf);
+        for let i = 0; i < model.num_params; i = i + 1 {
+            let pp = (Value*)model.all_params[i];
+            pp.data = buf[i];
+        }
+        free(buf);
+        println "Model loaded! ({model.num_params} params)";
+    } else {
+        // Train
+        println "No saved model found, training...";
+        let learning_rate = 0.01;
+        let beta1 = 0.85;
+        let beta2 = 0.99;
+        let eps_adam = 0.001;
+        let m = (float*)calloc(model.num_params, sizeof(float));
+        let v = (float*)calloc(model.num_params, sizeof(float));
+
+        let num_steps = 1000;
+        for let step = 0; step < num_steps; step = step + 1 {
+            let doc = docs[step % num_docs];
+            let doc_len = strlen(doc);
+
+            let tokens_len = doc_len + 2;
+            let tokens = (int*)malloc(tokens_len * sizeof(int));
+            tokens[0] = BOS;
+            for let i = 0; i < doc_len; i = i + 1 {
+                tokens[i + 1] = char_to_idx(doc[i]);
+            }
+            tokens[tokens_len - 1] = BOS;
+
+            let n_seq = BLOCK_SIZE;
+            if (tokens_len - 1) < n_seq { n_seq = tokens_len - 1; }
+
+            // Key/Value cache: flat 2D per layer [time * N_EMBD + dim]
+            let keys = (Value***)malloc(N_LAYER * sizeof(Value**));
+            let values_cache = (Value***)malloc(N_LAYER * sizeof(Value**));
+            for let li = 0; li < N_LAYER; li = li + 1 {
+                keys[li] = (Value**)malloc(n_seq * N_EMBD * sizeof(Value*));
+                values_cache[li] = (Value**)malloc(n_seq * N_EMBD * sizeof(Value*));
+            }
+
+            let losses = (Value**)zarena_alloc(&graph_arena, n_seq * sizeof(Value*));
+
+            for let pos_id = 0; pos_id < n_seq; pos_id = pos_id + 1 {
+                let token_id = tokens[pos_id];
+                let target_id = tokens[pos_id + 1];
+
+                let logits = gpt_forward(&model, token_id, pos_id, keys, values_cache, pos_id);
+                let probs = softmax(logits, VOCAB_SIZE);
+                let prob_t = (Value*)probs[target_id];
+                let loss_t = prob_t.log_v().neg_v();
+                losses[pos_id] = loss_t;
+            }
+
+            // Average loss
+            let total_loss = (Value*)new_value(0.0);
+            for let i = 0; i < n_seq; i = i + 1 {
+                let li = (Value*)losses[i];
+                total_loss = total_loss.add_v(li);
+            }
+            let loss_val = total_loss.div_v(new_value(n_seq * 1.0));
+
+            loss_val.backward();
+
+            // Gradient clipping (max norm 1.0)
+            let grad_norm_sq = 0.0;
+            for let i = 0; i < model.num_params; i = i + 1 {
+                let pp = (Value*)model.all_params[i];
+                grad_norm_sq = grad_norm_sq + (pp.grad * pp.grad);
+            }
+            let grad_norm = sqrtf(grad_norm_sq);
+            let clip = 1.0;
+            if grad_norm > 1.0 { clip = 1.0 / grad_norm; }
+
+            // Adam update
+            let lr_t = learning_rate * (1.0 - ((step * 1.0) / (num_steps * 1.0)));
+            let b1_pow = powf(beta1, (step + 1) * 1.0);
+            let b2_pow = powf(beta2, (step + 1) * 1.0);
+
+            for let i = 0; i < model.num_params; i = i + 1 {
+                let pp = (Value*)model.all_params[i];
+                let g = pp.grad * clip;
+
+                m[i] = (beta1 * m[i]) + ((1.0 - beta1) * g);
+                v[i] = (beta2 * v[i]) + ((1.0 - beta2) * (g * g));
+
+                let m_hat = m[i] / (1.0 - b1_pow);
+                let v_hat = v[i] / (1.0 - b2_pow);
+
+                pp.data = pp.data - (lr_t * m_hat / (sqrtf(v_hat) + eps_adam));
+                pp.grad = 0.0;
+                pp.visited = false;
+            }
+
+            println "Step {step + 1} / {num_steps} | Loss: {loss_val.data}";
+
+            // Cleanup heap allocations
+            for let li = 0; li < N_LAYER; li = li + 1 {
+                free(keys[li]);
+                free(values_cache[li]);
+            }
+            free(keys); free(values_cache);
+            free(tokens);
+
+            // O(1) arena reset — all graph nodes freed instantly
+            zarena_reset(&graph_arena);
+        }
+
+        free(m); free(v);
+
+        // Save model
+        println "Saving model to model.bin...";
+        let sf = fopen(model_file, "wb");
+        let buf = (float*)malloc(model.num_params * sizeof(float));
+        for let i = 0; i < model.num_params; i = i + 1 {
+            let pp = (Value*)model.all_params[i];
+            buf[i] = pp.data;
+        }
+        fwrite(buf, sizeof(float), model.num_params, sf);
+        fclose(sf);
+        free(buf);
+        println "Model saved!";
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Inference
+    // ═══════════════════════════════════════════════════════════════
+    println "\n--- Inference (hallucinated names) ---";
+    for let sample_idx = 0; sample_idx < 20; sample_idx = sample_idx + 1 {
+        let keys = (Value***)malloc(N_LAYER * sizeof(Value**));
+        let values_cache = (Value***)malloc(N_LAYER * sizeof(Value**));
+        for let li = 0; li < N_LAYER; li = li + 1 {
+            keys[li] = (Value**)malloc(BLOCK_SIZE * N_EMBD * sizeof(Value*));
+            values_cache[li] = (Value**)malloc(BLOCK_SIZE * N_EMBD * sizeof(Value*));
+        }
+
+        let token_id = BOS;
+        print "Sample {sample_idx + 1}: ";
+
+        let temperature = 0.5;
+        for let pos_id = 0; pos_id < BLOCK_SIZE; pos_id = pos_id + 1 {
+            let logits = gpt_forward(&model, token_id, pos_id, keys, values_cache, pos_id);
+
+            // Temperature scaling
+            for let i = 0; i < VOCAB_SIZE; i = i + 1 {
+                let li = (Value*)logits[i];
+                logits[i] = li.div_v(new_value(temperature));
+            }
+            let probs = softmax(logits, VOCAB_SIZE);
+
+            // Weighted random choice
+            let r = (rand() * 1.0) / (32767.0 + 1.0);
+            let cumulative = 0.0;
+            let next_token = 0;
+            for let i = 0; i < VOCAB_SIZE; i = i + 1 {
+                let pi = (Value*)probs[i];
+                cumulative = cumulative + pi.data;
+                if r <= cumulative {
+                    next_token = i;
+                    break;
+                }
+            }
+
+            token_id = next_token;
+            if token_id == BOS { break; }
+            let c = idx_to_char(token_id);
+            print "{c}";
+        }
+        println "";
+
+        for let li = 0; li < N_LAYER; li = li + 1 {
+            free(keys[li]); free(values_cache[li]);
+        }
+        free(keys); free(values_cache);
+
+        zarena_reset(&graph_arena);
+    }
+
+    zarena_free(&graph_arena);
+}
